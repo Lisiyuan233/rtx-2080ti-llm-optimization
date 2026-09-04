@@ -1,0 +1,7 @@
+results/raw/
+*.log
+*.jsonl
+*.pid
+.venv/
+__pycache__/
+*.pyc
