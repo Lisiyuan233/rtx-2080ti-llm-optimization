@@ -12,6 +12,9 @@ A measured optimization study for Qwen3.8-27B inference on modified RTX 2080 Ti 
 - A BF16 DFlash2 drafter was 21% slower than the embedded MTP head on Turing.
 - vLLM FP8 had 30%+ faster long-prompt prefill, but 30–48% slower decode on the old dual-Xeon host.
 - The included llama.cpp patch replaces host-staged internal all-reduce with direct peer staging when bidirectional peer access is available. It improved short English generation by 4–5% and long generation by 1.5–3% on the NVLink pair.
+- More than 40 CPU/NUMA/thread/poll configurations converged to a +0.11% English and +0.06% Chinese ABAB result, so none were deployed.
+- CUDA Graph replay already covered 97.8% of steady-state compute. Disabling graphs cost only 1.4% end to end.
+- A per-shape graph-cache experiment fixed permanent direct evaluation in the MTP draft path, but honest ABAB gains were only +0.30% English and +0.42% Chinese. It remains an opt-in experiment.
 
 Representative final results:
 
@@ -48,6 +51,8 @@ CUDA_VISIBLE_DEVICES=0,1 \
 ```
 
 See the [Chinese technical report](docs/REPORT.zh-CN.md), [results](RESULTS.md), and [patch notes](patches/llama.cpp/README.md) for the full methodology and limitations.
+
+The 2026-09-05 follow-up is documented in [CPU orchestration](docs/CPU-ORCHESTRATION.zh-CN.md), [CUDA Graph P0](docs/CUDA-GRAPH-P0.zh-CN.md), [CUDA Graph P1](docs/CUDA-GRAPH-P1.zh-CN.md), and the English [Nsight Systems CUDA Graph note](docs/NSYS-CUDA-GRAPH-BUSYTIME.md). The key measurement correction is that Nsight Systems' kernel table omits kernels executed inside CUDA Graph replay; GPU busy time must merge kernel and graph-trace intervals.
 
 ## Scope and licensing
 

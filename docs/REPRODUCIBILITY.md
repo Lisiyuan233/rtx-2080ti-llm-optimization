@@ -23,6 +23,9 @@ The model weights are not redistributed. Record the exact model filename and SHA
 6. Include a 2048-token generation to reduce startup noise.
 7. Save both the server log and full JSON response.
 8. Compare output bytes at temperature 0 when validating an all-reduce change.
+9. Interleave A/B configurations instead of running all A trials before all B trials.
+10. Report the mean and the per-round rows so clock and thermal drift remain visible.
+11. Decide the deployment threshold before looking at the result; this project used 3%.
 
 Use `scripts/check_topology.sh` for the environment snapshot and `scripts/benchmark_llama.sh` for isolated llama.cpp runs. Raw results are written under `results/raw/`, which is intentionally ignored by Git because responses may contain private prompts.
 
@@ -35,6 +38,16 @@ Use `scripts/check_topology.sh` for the environment snapshot and `scripts/benchm
 - At least three consecutive long requests complete.
 - A no-peer topology falls back without crashing.
 - Throughput is compared on the same day and with the same clock/thermal conditions.
+
+## CUDA Graph profiling checklist
+
+- Do not derive GPU busy time from the ordinary kernel table alone. Merge its intervals with `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, coalesce overlaps per device, and then calculate the union.
+- Separate warmup, direct evaluation, and replay calls. A high global replay rate can hide one permanently direct subgraph.
+- When changing graph-cache keys, keep the full node-property validation and compare deterministic output bytes or hashes.
+- Report graph on/off as an end-to-end ABAB test. Kernel launch counts alone do not establish user-visible speedup.
+- Keep run order and thermal drift visible. In the shape-key experiment, the first round was better than the three-round mean, but both remained below the deployment threshold.
+
+Sanitized per-run data for both experiments is stored in `results/cuda-graph-on-off-abab.csv` and `results/cuda-graph-shape-key-abab.csv`.
 
 ## vLLM comparison caveat
 

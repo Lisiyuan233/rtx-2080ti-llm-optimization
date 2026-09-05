@@ -16,6 +16,9 @@
 | DFlash2 BF16 drafter | 67.1 → 52.9 tok/s | 2080 Ti 上不启用 |
 | vLLM FP8 MTP3 | 解码比 llama.cpp 慢 30–48%，预填充快 30%+ | 老 CPU 主机保留 llama.cpp |
 | 主机中转 all-reduce → P2P/NVLink | 英文短生成 +4–5%，长生成 +1.5–3% | 补丁投入生产 |
+| CPU/NUMA/线程/poll 等 40+ 配置 | 最终 ABAB 仅 +0.1% | 不上线，默认参数已近最优 |
+| CUDA Graph on/off | graph on 仅快 1.4% | 覆盖已饱和，不做 mega-graph |
+| 按 shape 拆分 graph cache key | replay 机制修复成功，吞吐仅 +0.3–0.4% | 不上线，保留实验 env 开关 |
 
 最终配置在同一台机器上的代表性结果：
 
@@ -25,6 +28,16 @@
 - 约 14.5K-token 预填充：llama.cpp **335–699 tok/s**；vLLM FP8 约 **908 tok/s**
 
 完整实验条件、对照表和限制见 [中文技术报告](docs/REPORT.zh-CN.md) 与 [结果表](RESULTS.md)。这些数字只代表本项目的硬件、模型和软件版本，不应直接外推到其他模型或平台。
+
+## 2026-09-05 收尾：剩余优化空间
+
+CPU 编排、CUDA Graph 覆盖和 draft shape 分桶已经按统一门槛测完：
+
+- [CPU 编排扫描](docs/CPU-ORCHESTRATION.zh-CN.md)：NUMA 绑定、线程数、poll、HTTP 线程、governor、控制线程绑核和 CUDA wait mode 均未超过噪声；最终交错 ABAB 为英文 +0.11%、中文 +0.06%。
+- [CUDA Graph P0](docs/CUDA-GRAPH-P0.zh-CN.md)：稳态 graph replay 率 97.8%，graph on/off 只差 1.4%。nsys 的 kernel 表不会列出 graph replay 内核；合并 `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` 后，GPU 实际 busy 约 35.5ms/pass，而不是旧读法的约 17ms。
+- [CUDA Graph P1](docs/CUDA-GRAPH-P1.zh-CN.md)：确认 MTP draft step `nt=1` 和 catch-up `nt=4` 共享 cache key，导致永久 direct evaluation。按 shape 分桶后 draft bucket 达到 506/508 replay，但诚实 ABAB 只有英文 **+0.30%**、中文 **+0.42%**，低于 3% 上线门槛。
+
+因此生产仍保持 P2P all-reduce 补丁和原参数。shape-key 修复以默认关闭的[实验补丁](patches/llama.cpp/experimental/README.md)保留。若继续研究，唯一仍有量级依据的方向是削减 `spec_draft` 约 7.5ms/pass 的宿主固定成本，尤其是三步 draft sampling；本次仓库更新不宣称这条路线已经取得收益。
 
 ## 测试平台
 
@@ -124,7 +137,7 @@ configs/                 安全默认的 systemd 示例
 docs/                    完整技术报告与复现方法
 patches/llama.cpp/       P2P all-reduce 格式化补丁及说明
 prompts/                 固定英文/中文测试提示词
-results/                 已整理的测试结果
+results/                 已整理结果与脱敏 ABAB CSV
 scripts/                 拓扑检查和基准脚本
 ```
 

@@ -103,20 +103,21 @@ F16 KV 改为 Q8_0 后从约 66.9 降到 53.0 tok/s。量化 KV 节省显存，�
 
 结果符合预先风险判断：vLLM 的 Python/服务控制面更依赖现代 CPU 单核性能，E5-2680 v2 放大了逐 token 编排成本；它的批处理和长提示词预填充路径仍有明显优势。生产场景以单请求长生成为主，因此保留 llama.cpp；如果工作负载转为批量预填充，应重新评估 vLLM。
 
-## 7. nsys 剖析与算子取舍
+## 7. nsys 计量纠错与 CUDA Graph P0
 
-在 2048-token 稳态 decode 中，MTP 接受率约 0.95，平均每个 speculative pass 产出约 3.85 token，周期约 49 ms。估算时间分布：
+早期分析只读取了 Nsight Systems 的普通 CUDA kernel 表，因此严重低估了 GPU 工作时间。CUDA Graph replay 内执行的 kernel 不会作为普通 kernel 行出现，必须把 `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` 中的 graph execution 区间与 kernel 区间合并后再求 busy-time 并集。完整方法见 [Nsight Systems CUDA Graph 计量笔记](NSYS-CUDA-GRAPH-BUSYTIME.md)。
 
-| 项 | 每 pass | 墙钟占比 |
-|---|---:|---:|
-| 62 层计算 graph | ~13.5 ms | ~28% |
-| internal all-reduce | ~3.7 ms | ~7.5% |
-| CPU 采样与 draft/verify 编排空隙 | ~16–29 ms | ~33–40% |
-| MTP draft graph 等 | ~2–3 ms | ~5% |
+修正后的稳态 speculative pass 约 45.2ms，时间分布为：
 
-16.8GB 权重除以两卡合计约 1232GB/s 的显存带宽，理论读一遍约 13.6 ms，与层计算实测非常接近。权重 GEMM 已贴近带宽 roofline，自写 GEMM 或反量化核没有足够空间。真正的大头是 CPU 编排，但那需要更深的 llama.cpp 调度重构。
+| 项 | 每 pass | 解释 |
+|---|---:|---|
+| target decode / 同步窗口 | ~35.5 ms | GPU 确实在忙，不是 17ms GPU 加大段 CPU 空洞 |
+| GPU0 graph execution | ~33.3 ms | 来自 graph-trace 表 |
+| P2P all-reduce kernel | ~1.7 ms | 约 137 次/pass，每次约 13.3µs |
+| GPU0 idle | ~11.0 ms | 主要邻接 draft 路径 |
+| `spec_draft` | ~7.5 ms | GPU 仅约 1ms，余下是宿主固定成本 |
 
-all-reduce 占比虽小，却是一个边界清楚、可验证的局部优化。原 internal 路径面向没有 P2P 的机器，写入 pin 住的主机内存、用主机 flag 握手，再从主机读取对端数据；在已经有 NVLink 的两张卡上，这会绕远路。
+P0 的稳态 graph replay 覆盖率已经达到 97.8%。关闭 CUDA Graph 的 ABAB×5 对照中，英文为 82.73 对 81.59 tok/s，中文为 50.18 对 49.50 tok/s，端到端收益约 1.4%。因此 graph 本身有效，但总收益上限不足以支持继续做 mega-graph 或跨边界大重构。
 
 ## 8. P2P all-reduce 补丁
 
@@ -140,7 +141,31 @@ all-reduce 占比虽小，却是一个边界清楚、可验证的局部优化。
 
 连续三轮 2048-token 生成和中文正文测试未发现异常。补丁只固定验证在 llama.cpp `9723942`；上游文件继续演进时应 rebase 并重新跑位精确与回退测试。
 
-## 9. 最终建议
+## 9. CPU 编排负结果
+
+基于早期错误的 kernel-only 解读，项目曾把主要候选瓶颈指向 CPU 编排。为避免凭感觉下结论，实际扫描了 NUMA 绑定、CPU 亲和性、生成线程、batch 线程、poll、HTTP 线程、CPU governor 等 40 多组配置，并以五轮随机/交错顺序复测。最佳候选与默认值的最终 ABAB 为：
+
+| 场景 | 默认 | 候选 | 差值 |
+|---|---:|---:|---:|
+| 英文 2048 token | 81.53 | 81.62 | +0.11% |
+| 中文正文 1024 token | 49.63 | 49.66 | +0.06% |
+
+源码级的控制线程绑核和 CUDA wait mode 也都低于 0.2%。30 分钟中文 soak 共完成 86 个请求、零错误，前后半段吞吐漂移 -0.04%，没有发现隐藏的稳定性收益。所有候选都低于预设的 3% 上线门槛，生产参数保持原样。详见 [CPU 编排结果](CPU-ORCHESTRATION.zh-CN.md)。
+
+## 10. CUDA Graph P1：draft shape 分桶
+
+P1 插桩确认 draft 路径恰好有两个高频 shape：draft step 恒为 `n_tokens=1`（2874 次），catch-up 恒为 `n_tokens=4`（958 次）。MTP nextn 层子图同时服务这两种输入，但原 graph cache key 只描述拓扑，两者落入同一 key。cache 每个 key 只保存一份 `node_props` 与 warmup 状态，并要求连续两次属性一致；实际序列是 `4,1,1,1,4,...`，所以 warmup 永远无法完成，draft 子图永久走逐 kernel direct evaluation。
+
+最小实验 `GGML_CUDA_SHAPE_KEYS=1` 把 leading token shape 加入 cache key，同时保留每次完整 `node_props` 校验。启用后 draft bucket replay 达 506/508，warmup reset 从 870 降到 303，direct evaluation 从 2352 降到 1779；温度 0 的输出 hash 在 6/6 轮中逐字节一致。
+
+| 场景 | shape keys on | shape keys off | 差值 |
+|---|---:|---:|---:|
+| 英文 2048 token | 82.76 | 82.51 | +0.30% |
+| 中文正文 1024 token | 50.29 | 50.08 | +0.42% |
+
+两组配置都随轮次出现热漂移。最干净的第一轮差值为英文 +1.24%、中文 +0.88%，仍未达到 3% 门槛。机制修复成立，但 `spec_draft` 仍停在约 7.5ms，说明 API 发射碎片是症状而非主要成本。该改动只作为默认关闭的[实验补丁](../patches/llama.cpp/experimental/README.md)保留，不进入生产。详见 [P1 结果](CUDA-GRAPH-P1.zh-CN.md)。
+
+## 11. 最终建议
 
 对类似“多张旧卡、只有部分卡有高速互联”的机器：
 
@@ -149,6 +174,10 @@ all-reduce 占比虽小，却是一个边界清楚、可验证的局部优化。
 3. 显存够用时比较 F16 与量化 KV 的实际吞吐；
 4. 把预填充与解码分开看，vLLM 和 llama.cpp 可能各胜一段；
 5. 用 profiler 判断是显存带宽、通信还是 CPU 空隙，再决定是否写算子；
-6. 发布结果时保留模型格式、CPU、上下文、接受率和测量口径，避免只报一个峰值。
+6. 分析 CUDA Graph 时必须合并普通 kernel 与 graph-trace 区间，不能只看 kernel 表；
+7. 发布结果时保留模型格式、CPU、上下文、接受率和测量口径，避免只报一个峰值；
+8. 预先设定上线门槛，并让负结果真正阻止无收益改动进入生产。
 
 本项目最终生产路线是双卡 NVLink、F16 KV、MTP3、llama.cpp internal all-reduce 加 P2P 补丁。无桥的第三张 GPU 留给独立的图像/视频生成任务，比加入同一推理实例更有价值。
+
+截至 2026-09-05，CPU 编排、CUDA Graph 覆盖与 shape-key 方向均已穷尽。唯一仍有量级依据、但尚未实现收益的候选，是削减每个 speculative pass 中约 7.5ms 的 draft 宿主固定成本，特别是三步 draft sampling。目标若能降到不高于 5ms，理论上可能带来约 3–6% 改善；这是研究假设，不是本项目已取得的结果。

@@ -1,0 +1,59 @@
+From f29066da58225dcd37e74b83005aee009ec8830e Mon Sep 17 00:00:00 2001
+From: Lisiyuan233 <noreply@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 14:36:03 +0800
+Subject: [PATCH] ggml-cuda: bucket graph cache by leading shape
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a6fc655..812eac2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2586,10 +2586,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     return cgraph->nodes[0];
+ }
+ 
+-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
++static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
+     bool res = false;
+ 
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (cgraph->uid != 0 &&
+@@ -4266,13 +4265,30 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
++    // P1 (cuda-graph plan 20260905): a subgraph whose token-count dimension
++    // alternates between calls (e.g. the MTP nextn layer serving both the
++    // nt=n-ubatch catch-up decode and the nt=1 draft steps) never sees two
++    // consecutive identical prop sets, so its warmup never completes and it
++    // degrades to permanent kernel-by-kernel evaluation.  Fold the leading
++    // dims into the cache key so each shape owns its own graph + warmup
++    // state.  The full node_props memcmp still validates every replay, so
++    // this cannot pair a graph with mismatched pointers.
++    static const bool shape_keys = getenv("GGML_CUDA_SHAPE_KEYS") != nullptr;
++    if (shape_keys) {
++        const ggml_tensor * n0 = cgraph->nodes[0];
++        const uintptr_t sk = (uintptr_t) n0->ne[0] * 0x9E3779B97F4A7C15ULL ^
++                             (uintptr_t) n0->ne[1] * 0xC2B2AE3D27D4EB4FULL ^
++                             (uintptr_t) n0->ne[2] * 0x165667B19E3779F9ULL;
++        graph_key = (const void *) ((uintptr_t) graph_key ^ (sk ? sk : 1));
++    }
++
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+     if (graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
++            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
+ 
+             if (!graph->warmup_complete) {
+                 // Warmup: need at least 2 calls with no property change on the 2nd call
+-- 
+2.43.0

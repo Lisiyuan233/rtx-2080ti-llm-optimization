@@ -1,0 +1,3 @@
+workload,default_tg_tps,candidate_tg_tps,delta_percent,decision
+en2048,81.53,81.62,0.11,do_not_deploy
+zh1024,49.63,49.66,0.06,do_not_deploy

@@ -26,3 +26,4 @@ jobs:
           git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git upstream-llama.cpp
           git -C upstream-llama.cpp checkout 9723942
           git -C upstream-llama.cpp apply --check ../patches/llama.cpp/0001-ggml-cuda-add-NVLink-P2P-allreduce-path-for-2-GPU-t.patch
+          git -C upstream-llama.cpp apply --check ../patches/llama.cpp/experimental/0001-ggml-cuda-bucket-graph-cache-by-leading-shape.patch

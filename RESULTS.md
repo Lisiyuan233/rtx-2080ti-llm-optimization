@@ -53,15 +53,41 @@ This is a deployment comparison, not a pure engine A/B: llama.cpp used Q4_K_M GG
 
 The old Ivy Bridge Xeon host is the likely cause of much of the decode regression: vLLM's Python/service control plane is more sensitive to single-core latency than llama.cpp's C++ loop. vLLM remains an attractive route for prefill-heavy or batched workloads.
 
-## Profiling summary
+## CPU orchestration follow-up
 
-For a steady 2048-token decode run, one speculative pass produced about 3.85 accepted tokens and took roughly 49 ms:
+More than 40 affinity, thread, poll, HTTP-thread, and governor configurations were tested in randomized five-round matrices. The best candidate was re-run against the default in an interleaved ABAB confirmation:
 
-| Component | Time per pass | Approx. wall share |
-|---|---:|---:|
-| 62-layer compute graph | ~13.5 ms | ~28% |
-| Internal all-reduce kernels | ~3.7 ms | ~7.5% |
-| CPU sampling and draft/verify orchestration gaps | ~16–29 ms | ~33–40% |
-| MTP draft graph and other work | ~2–3 ms | ~5% |
+| Workload | Default | Candidate | Delta | Decision |
+|---|---:|---:|---:|---|
+| English, 2048 generated tokens | 81.53 | 81.62 | +0.11% | Do not deploy |
+| Chinese prose, 1024 generated tokens | 49.63 | 49.66 | +0.06% | Do not deploy |
 
-Layer compute was already near the weight-bandwidth roofline. This ruled out custom GEMM/dequantization work and motivated the smaller, measurable P2P all-reduce patch.
+A 30-minute Chinese soak completed 86 requests with zero errors and -0.04% first-half to second-half drift. Source-level control-thread affinity and CUDA wait-mode experiments were also below 0.2%.
+
+## CUDA Graph P0: corrected profiling
+
+An earlier kernel-table-only reading understated GPU work because Nsight Systems records kernels executed inside CUDA Graph replay in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, not the ordinary kernel table. The corrected steady-state accounting is:
+
+| Component | Time per pass | Interpretation |
+|---|---:|---|
+| Whole speculative pass | ~45.2 ms | 100% wall budget |
+| Target decode / synchronization window | ~35.5 ms | Host is waiting for genuinely busy GPUs |
+| GPU0 graph execution | ~33.3 ms | Must be read from graph-trace rows |
+| P2P all-reduce kernels | ~1.7 ms | ~137 calls/pass, about 13.3µs each |
+| GPU0 idle | ~11.0 ms | Mostly adjacent to the draft path |
+| `spec_draft` window | ~7.5 ms | Only ~1 ms GPU work; remainder is fixed host work |
+
+CUDA Graph on/off ABAB×5 produced 82.73 vs 81.59 tok/s for English and 50.18 vs 49.50 tok/s for Chinese: graphs are correct and useful, but their entire end-to-end value on this host is only about 1.4%. Steady-state replay was already saturated at 97.8%.
+
+## CUDA Graph P1: per-shape cache keys
+
+The MTP nextn-layer subgraph alternates between catch-up `n_tokens=4` and three draft steps at `n_tokens=1`. Both shapes shared one graph-cache key, so the stored properties alternated `4,1,1,1,4,...` and never completed the two-identical-call warmup requirement.
+
+With `GGML_CUDA_SHAPE_KEYS=1`, each leading shape receives a separate cache key. Draft-bucket replay changed from none to 506/508 calls, warmup resets fell from 870 to 303, and direct evaluations fell from 2352 to 1779. Temperature-0 output hashes matched in all six runs.
+
+| Workload | Shape keys on | Shape keys off | Delta |
+|---|---:|---:|---:|
+| English, 2048 generated tokens | 82.76 | 82.51 | **+0.30%** |
+| Chinese prose, 1024 generated tokens | 50.29 | 50.08 | **+0.42%** |
+
+Both configurations slowed with thermal/run-order drift. The cleanest first round showed +1.24% English and +0.88% Chinese, still below the 3% deployment threshold. The mechanism is valid, but `spec_draft` remained 7.5 ms; launch fragmentation was a symptom rather than the limiting cost. See the sanitized raw rows in `results/cuda-graph-shape-key-abab.csv`.
